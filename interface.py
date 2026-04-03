@@ -2,6 +2,7 @@ import os
 import requests
 from openai import OpenAI
 
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://viji217-soil-analysis-env.hf.space")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 HF_TOKEN = os.getenv("HF_TOKEN")
