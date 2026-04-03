@@ -3,7 +3,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
-
 from soil_env.env import SoilAnalysisEnv, SOIL_PROFILES, ALL_CROPS, ALL_FERTILIZERS
 
 app = FastAPI(
@@ -29,13 +28,13 @@ class StepRequest(BaseModel):
 def root():
     return """
     <html><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px">
-    <h1> Soil Analysis AI Environment</h1>
+    <h1>Soil Analysis AI Environment</h1>
     <p>An OpenEnv-compatible environment for training AI agents to analyze soil data.</p>
     <h2>Tasks</h2>
     <ul>
-      <li><b>easy</b> — identify soil type only</li>
-      <li><b>medium</b> — identify soil type + recommend fertilizer</li>
-      <li><b>hard</b> — identify soil type + fertilizer + best crop</li>
+      <li><b>easy</b> - identify soil type only</li>
+      <li><b>medium</b> - identify soil type + recommend fertilizer</li>
+      <li><b>hard</b> - identify soil type + fertilizer + best crop</li>
     </ul>
     <p><a href="/docs">Open API docs</a></p>
     </body></html>
@@ -53,7 +52,9 @@ def info():
     }
 
 @app.post("/reset")
-def reset(req: ResetRequest):
+async def reset(req: Optional[ResetRequest] = None):
+    if req is None:
+        req = ResetRequest()
     if req.task not in ("easy", "medium", "hard"):
         raise HTTPException(status_code=400, detail="task must be 'easy', 'medium', or 'hard'")
     env = SoilAnalysisEnv(task=req.task, seed=req.seed)
@@ -62,7 +63,9 @@ def reset(req: ResetRequest):
     return {"session_id": req.session_id, "observation": obs}
 
 @app.post("/step")
-def step(req: StepRequest):
+async def step(req: Optional[StepRequest] = None):
+    if req is None:
+        raise HTTPException(status_code=400, detail="Request body required")
     env = _sessions.get(req.session_id)
     if env is None:
         raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
