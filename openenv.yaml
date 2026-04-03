@@ -1,0 +1,6 @@
+spec_version: 1
+name: soil-analysis-env
+type: environment
+runtime: docker
+app: app.py
+port: 8000
