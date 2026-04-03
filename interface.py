@@ -1,74 +1,84 @@
-import os
-import requests
-from openai import OpenAI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
+from soil_env.env import SoilAnalysisEnv, SOIL_PROFILES, ALL_CROPS, ALL_FERTILIZERS
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://viji217-soil-analysis-env.hf.space")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
-HF_TOKEN = os.getenv("HF_TOKEN")
-
-client = OpenAI(
-    api_key=HF_TOKEN,
-    base_url=API_BASE_URL
+app = FastAPI(
+    title="Soil Analysis AI Environment",
+    description="OpenEnv-compatible environment for soil type identification, fertilizer, and crop recommendation.",
+    version="1.0.0",
 )
 
-def reset(task="easy", seed=42, session_id="default"):
-    payload = {"task": task, "seed": seed, "session_id": session_id}
-    response = requests.post(f"{API_BASE_URL}/reset", json=payload)
-    response.raise_for_status()
-    return response.json()
+_sessions: dict = {}
 
-def step(soil_type, fertilizer=None, crop=None, session_id="default"):
-    payload = {"session_id": session_id, "soil_type": soil_type}
-    if fertilizer:
-        payload["fertilizer"] = fertilizer
-    if crop:
-        payload["crop"] = crop
-    response = requests.post(f"{API_BASE_URL}/step", json=payload)
-    response.raise_for_status()
-    return response.json()
+class ResetRequest(BaseModel):
+    task: str = "easy"
+    seed: Optional[int] = 42
+    session_id: str = "default"
 
-def predict_soil(ph, moisture, nitrogen, organic):
-    if ph < 5.5 and moisture > 50 and nitrogen >= 0.20:
-        return "peaty"
-    if moisture < 25 and nitrogen < 0.15 and organic < 1.8:
-        return "sandy"
-    if moisture >= 40 and organic >= 2.0:
-        return "clay"
-    if 25 <= moisture <= 50 and nitrogen >= 0.15 and organic >= 1.5:
-        return "loamy"
-    if 25 <= moisture <= 55 and organic >= 1.3:
-        return "silty"
-    if moisture < 30:
-        return "sandy"
-    return "loamy"
+class StepRequest(BaseModel):
+    session_id: str = "default"
+    soil_type: str
+    fertilizer: Optional[str] = None
+    crop: Optional[str] = None
 
-def get_fertilizer(soil_type):
-    return {"peaty": "lime", "sandy": "npk", "clay": "compost", "loamy": "balanced", "silty": "phosphorus"}.get(soil_type, "balanced")
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return """
+    <html><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px">
+    <h1>Soil Analysis AI Environment</h1>
+    <p>An OpenEnv-compatible environment for training AI agents to analyze soil data.</p>
+    <h2>Tasks</h2>
+    <ul>
+      <li><b>easy</b> - identify soil type only</li>
+      <li><b>medium</b> - identify soil type + recommend fertilizer</li>
+      <li><b>hard</b> - identify soil type + fertilizer + best crop</li>
+    </ul>
+    <p><a href="/docs">Open API docs</a></p>
+    </body></html>
+    """
 
-def get_crop(soil_type):
-    return {"peaty": "blueberry", "sandy": "carrot", "clay": "wheat", "loamy": "maize", "silty": "rice"}.get(soil_type, "maize")
+@app.get("/info")
+def info():
+    return {
+        "name": "SoilAnalysisEnv",
+        "version": "1.0.0",
+        "tasks": ["easy", "medium", "hard"],
+        "soil_types": sorted(SOIL_PROFILES.keys()),
+        "fertilizers": sorted(ALL_FERTILIZERS),
+        "crops": sorted(ALL_CROPS),
+    }
 
-def run_inference(task="easy", session_id="default"):
-    print("START")
-    result = reset(task=task, session_id=session_id)
-    obs = result["observation"]
-    soil_readings = obs.get("soil_readings", {})
-    ph = soil_readings.get("ph", 6.5)
-    moisture = soil_readings.get("moisture_pct", 40)
-    nitrogen = soil_readings.get("nitrogen_pct", 0.1)
-    organic = soil_readings.get("organic_matter_pct", 2.0)
+@app.post("/reset")
+async def reset(req: Optional[ResetRequest] = None):
+    if req is None:
+        req = ResetRequest()
+    if req.task not in ("easy", "medium", "hard"):
+        raise HTTPException(status_code=400, detail="task must be 'easy', 'medium', or 'hard'")
+    env = SoilAnalysisEnv(task=req.task, seed=req.seed)
+    obs = env.reset()
+    _sessions[req.session_id] = env
+    return {"session_id": req.session_id, "observation": obs}
 
-    soil_type = predict_soil(ph, moisture, nitrogen, organic)
-    fertilizer = get_fertilizer(soil_type) if task in ("medium", "hard") else None
-    crop = get_crop(soil_type) if task == "hard" else None
-
-    print("STEP soil_type=" + soil_type)
-    step_result = step(soil_type=soil_type, fertilizer=fertilizer, crop=crop, session_id=session_id)
-
-    reward = step_result.get("reward", 0)
-    print("END reward=" + str(reward))
-    return step_result
+@app.post("/step")
+async def step(req: Optional[StepRequest] = None):
+    if req is None:
+        raise HTTPException(status_code=400, detail="Request body required")
+    env = _sessions.get(req.session_id)
+    if env is None:
+        raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
+    action = {"soil_type": req.soil_type}
+    if req.fertilizer:
+        action["fertilizer"] = req.fertilizer
+    if req.crop:
+        action["crop"] = req.crop
+    try:
+        obs, reward, done, info = env.step(action)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"observation": obs, "reward": reward, "done": done, "info": info}
 
 if __name__ == "__main__":
-    for task in ("easy", "medium", "hard"):
-        run_inference(task=task, session_id=task)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
