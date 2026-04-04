@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-server = "server.app:app"
+server = "server.app:start"    # ← change app to start
 
 [tool.setuptools.packages.find]
 where = ["."]
