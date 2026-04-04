@@ -1,0 +1,26 @@
+name: Generate uv.lock
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  uv-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Run uv lock
+        run: uv lock
+
+      - name: Commit uv.lock
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add uv.lock
+          git diff --staged --quiet || git commit -m "auto: generate uv.lock"
+          git push
