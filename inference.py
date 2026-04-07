@@ -1,164 +1,60 @@
-import os
 import sys
+from soil_env.env import SoilAnalysisEnv, SOIL_PROFILES
 
-# Safe import of requests
-try:
-    import requests
-except ImportError:
-    print("ERROR: 'requests' module not found. Installing...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
+RULES = [
+    (3.5, 5.5, 55, 100, 0.25, 15.0, "peaty"),
+    (5.5, 6.5, 10, 30, 0.00, 0.0,  "sandy"),
+    (6.0, 7.5, 35, 60, 0.12, 1.8,  "clay"),
+    (6.0, 7.0, 25, 50, 0.18, 2.0,  "loamy"),
+    (6.0, 7.0, 30, 52, 0.08, 1.3,  "silty"),
+]
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://viji217-soil-analysis-env.hf.space")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
+def rule_based_agent(obs):
+    r = obs["soil_readings"]
+    ph    = r["ph"]
+    mois  = r["moisture_pct"]
+    nit   = r["nitrogen_pct"]
+    org   = r["organic_matter_pct"]
 
-TIMEOUT = 30  # seconds for all requests
+    predicted_soil = "loamy"
+    for ph_lo, ph_hi, m_lo, m_hi, n_lo, o_lo, stype in RULES:
+        if ph_lo <= ph <= ph_hi and m_lo <= mois <= m_hi and nit >= n_lo and org >= o_lo:
+            predicted_soil = stype
+            break
 
-
-def reset(task="easy", seed=42, session_id="default"):
-    payload = {"task": task, "seed": seed, "session_id": session_id}
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/reset",
-            json=payload,
-            timeout=TIMEOUT
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.ConnectionError as e:
-        print(f"ERROR: Cannot connect to server at {API_BASE_URL}. Is it running? {e}")
-        raise
-    except requests.exceptions.Timeout:
-        print(f"ERROR: /reset request timed out after {TIMEOUT}s.")
-        raise
-    except requests.exceptions.HTTPError as e:
-        print(f"ERROR: /reset returned HTTP error: {e}")
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error in reset(): {e}")
-        raise
+    action = {"soil_type": predicted_soil}
+    if obs["task_level"] in ("medium", "hard"):
+        action["fertilizer"] = SOIL_PROFILES[predicted_soil]["best_fertilizer"]
+    if obs["task_level"] == "hard":
+        action["crop"] = SOIL_PROFILES[predicted_soil]["best_crop"]
+    return action
 
 
-def step(soil_type, fertilizer=None, crop=None, session_id="default"):
-    payload = {"session_id": session_id, "soil_type": soil_type}
-    if fertilizer:
-        payload["fertilizer"] = fertilizer
-    if crop:
-        payload["crop"] = crop
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/step",
-            json=payload,
-            timeout=TIMEOUT
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.ConnectionError as e:
-        print(f"ERROR: Cannot connect to server at {API_BASE_URL}. Is it running? {e}")
-        raise
-    except requests.exceptions.Timeout:
-        print(f"ERROR: /step request timed out after {TIMEOUT}s.")
-        raise
-    except requests.exceptions.HTTPError as e:
-        print(f"ERROR: /step returned HTTP error: {e}")
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error in step(): {e}")
-        raise
+def run_task(task, episodes=10, seed=42):
+    env = SoilAnalysisEnv(task=task, seed=seed)
 
+    print(f"[START] task={task}", flush=True)
 
-def predict_soil(ph, moisture, nitrogen, organic):
-    try:
-        ph       = float(ph)
-        moisture = float(moisture)
-        nitrogen = float(nitrogen)
-        organic  = float(organic)
+    total_reward = 0.0
+    for ep in range(episodes):
+        obs    = env.reset()
+        action = rule_based_agent(obs)
+        _, reward, _, info = env.step(action)
+        total_reward += reward
+        print(f"[STEP] step={ep+1} reward={round(reward, 4)}", flush=True)
 
-        if ph < 5.5 and moisture > 50 and nitrogen >= 0.20:
-            return "peaty"
-        if moisture < 25 and nitrogen < 0.15 and organic < 1.8:
-            return "sandy"
-        if moisture >= 40 and organic >= 2.0:
-            return "clay"
-        if 25 <= moisture <= 50 and nitrogen >= 0.15 and organic >= 1.5:
-            return "loamy"
-        if 25 <= moisture <= 55 and organic >= 1.3:
-            return "silty"
-        if moisture < 30:
-            return "sandy"
-        return "loamy"
-    except (TypeError, ValueError) as e:
-        print(f"WARNING: Could not parse soil readings ({e}), defaulting to loamy.")
-        return "loamy"
-
-
-def get_fertilizer(soil_type):
-    mapping = {
-        "peaty":  "lime",
-        "sandy":  "npk",
-        "clay":   "compost",
-        "loamy":  "balanced",
-        "silty":  "phosphorus"
-    }
-    return mapping.get(soil_type, "balanced")
-
-
-def get_crop(soil_type):
-    mapping = {
-        "peaty":  "blueberry",
-        "sandy":  "carrot",
-        "clay":   "wheat",
-        "loamy":  "maize",
-        "silty":  "rice"
-    }
-    return mapping.get(soil_type, "maize")
-
-
-def run_inference(task="easy", session_id="default"):
-    print(f"\n=== Task: {task.upper()} | Session: {session_id} ===")
-    print("START")
-
-    try:
-        result = reset(task=task, session_id=session_id)
-    except Exception:
-        print(f"FAILED: Could not reset for task={task}. Skipping.")
-        return None
-
-    try:
-        obs = result.get("observation", {})
-        soil_readings = obs.get("soil_readings", {})
-        ph       = soil_readings.get("ph", 6.5)
-        moisture = soil_readings.get("moisture_pct", 40)
-        nitrogen = soil_readings.get("nitrogen_pct", 0.1)
-        organic  = soil_readings.get("organic_matter_pct", 2.0)
-    except (AttributeError, KeyError) as e:
-        print(f"WARNING: Could not parse observation ({e}), using defaults.")
-        ph, moisture, nitrogen, organic = 6.5, 40, 0.1, 2.0
-
-    soil_type  = predict_soil(ph, moisture, nitrogen, organic)
-    fertilizer = get_fertilizer(soil_type) if task in ("medium", "hard") else None
-    crop       = get_crop(soil_type)       if task == "hard"             else None
-
-    print(f"STEP soil_type={soil_type}, fertilizer={fertilizer}, crop={crop}")
-
-    try:
-        step_result = step(
-            soil_type=soil_type,
-            fertilizer=fertilizer,
-            crop=crop,
-            session_id=session_id
-        )
-    except Exception:
-        print(f"FAILED: Could not complete step for task={task}.")
-        return None
-
-    reward = step_result.get("reward", 0)
-    print(f"END reward={reward}")
-    return step_result
+    score = round(total_reward / episodes, 4)
+    print(f"[END] task={task} score={score} steps={episodes}", flush=True)
+    return score
 
 
 if __name__ == "__main__":
-    for task in ("easy", "medium", "hard"):
-        run_inference(task=task, session_id=task)
+    tasks = ["easy", "medium", "hard"]
+    scores = {}
+    for task in tasks:
+        scores[task] = run_task(task, episodes=10, seed=42)
+
+    overall = round(sum(scores.values()) / len(scores), 4)
+    print(f"[START] task=overall", flush=True)
+    print(f"[STEP] step=1 reward={overall}", flush=True)
+    print(f"[END] task=overall score={overall} steps=1", flush=True)
