@@ -1,14 +1,18 @@
 """
-app.py  —  Soil Analysis Environment Server
-Fully OpenEnv-compatible: /health, /schema, /metadata, /state, /reset, /step, /ws
+server/app.py  —  Soil Analysis Environment Server
+Required by openenv validate: must have main() function callable with if __name__ == "__main__"
 """
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 from typing import Optional, Any, Dict
 import uvicorn
 import json
+import sys
+import os
+
+# Allow imports from parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from soil_env.env import SoilAnalysisEnv, SOIL_PROFILES, ALL_CROPS, ALL_FERTILIZERS
 
@@ -19,27 +23,6 @@ app = FastAPI(
 )
 
 _sessions: dict = {}
-
-# ─────────────────────────────────────────────
-# Request models — ALL fields optional with defaults
-# ─────────────────────────────────────────────
-
-class ResetRequest(BaseModel):
-    task: Optional[str] = "easy"
-    seed: Optional[int] = None
-    session_id: Optional[str] = "default"
-    episode_id: Optional[str] = None
-    # Allow any extra fields the evaluator might send
-    model_config = {"extra": "allow"}
-
-class StepRequest(BaseModel):
-    session_id: Optional[str] = "default"
-    soil_type: Optional[str] = "loamy"
-    fertilizer: Optional[str] = None
-    crop: Optional[str] = None
-    # OpenEnv standard step wraps action in "action" key
-    action: Optional[Dict[str, Any]] = None
-    model_config = {"extra": "allow"}
 
 # ─────────────────────────────────────────────
 # Required OpenEnv endpoints
@@ -105,26 +88,12 @@ def state_endpoint(session_id: str = "default"):
         "episode_done":   env._done,
     }
 
-# ─────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────
-
 @app.get("/", response_class=HTMLResponse)
 def root():
     return """
 <html><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px">
 <h1>🌱 Soil Analysis AI Environment</h1>
 <p>An OpenEnv-compatible environment for training AI agents to analyse soil data.</p>
-<h2>Endpoints</h2>
-<ul>
-  <li><b>GET  /health</b>   — health check</li>
-  <li><b>GET  /metadata</b> — environment metadata</li>
-  <li><b>GET  /schema</b>   — action / observation schemas</li>
-  <li><b>POST /reset</b>    — start a new episode</li>
-  <li><b>POST /step</b>     — submit an action</li>
-  <li><b>GET  /state</b>    — current internal state</li>
-  <li><b>WS   /ws</b>       — WebSocket protocol</li>
-</ul>
 <p><a href="/docs">Open API docs</a></p>
 </body></html>
 """
@@ -140,47 +109,32 @@ def info():
         "crops": sorted(ALL_CROPS),
     }
 
-# ─────────────────────────────────────────────
-# Core RL endpoints
-# ─────────────────────────────────────────────
-
 @app.post("/reset")
 async def reset(request: Request):
-    """
-    Accepts empty body, JSON body, or any OpenEnv reset format.
-    """
     try:
         body = await request.json()
     except Exception:
         body = {}
-
     if body is None:
         body = {}
 
     task       = body.get("task", "easy") or "easy"
     seed       = body.get("seed", None)
     session_id = body.get("session_id", "default") or "default"
-
     if task not in ("easy", "medium", "hard"):
         task = "easy"
 
     env = SoilAnalysisEnv(task=task, seed=seed)
     obs = env.reset(seed=seed)
     _sessions[session_id] = env
-
     return {"session_id": session_id, "observation": obs}
-
 
 @app.post("/step")
 async def step(request: Request):
-    """
-    Accepts action as flat JSON or nested under "action" key.
-    """
     try:
         body = await request.json()
     except Exception:
         body = {}
-
     if body is None:
         body = {}
 
@@ -189,18 +143,15 @@ async def step(request: Request):
     if env is None:
         raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
 
-    # Support both flat and nested action formats
-    # Flat:   {"soil_type": "loamy", "fertilizer": "Compost"}
-    # Nested: {"action": {"soil_type": "loamy"}}
     if "action" in body and isinstance(body["action"], dict):
         action_data = body["action"]
     else:
         action_data = body
 
     action = {
-        "soil_type":  action_data.get("soil_type",  "loamy"),
+        "soil_type":  action_data.get("soil_type", "loamy"),
         "fertilizer": action_data.get("fertilizer", None),
-        "crop":       action_data.get("crop",        None),
+        "crop":       action_data.get("crop", None),
     }
 
     try:
@@ -208,27 +159,19 @@ async def step(request: Request):
         if isinstance(result, tuple):
             obs, reward, done, info = result
         else:
-            obs    = result
-            reward = 0.0
-            done   = True
-            info   = {}
+            obs, reward, done, info = result, 0.0, True, {}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"observation": obs, "reward": reward, "done": done, "info": info}
 
-# ─────────────────────────────────────────────
-# WebSocket /ws — primary evaluation path
-# ─────────────────────────────────────────────
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     env: Optional[SoilAnalysisEnv] = None
-
     try:
         while True:
-            raw   = await websocket.receive_text()
+            raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
             except Exception:
@@ -252,15 +195,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 if env is None:
                     await websocket.send_text(json.dumps({"type": "error", "data": {"message": "Call reset first"}}))
                     continue
-                # Support nested action key
                 if "action" in data and isinstance(data["action"], dict):
                     action_data = data["action"]
                 else:
                     action_data = data
                 action = {
-                    "soil_type":  action_data.get("soil_type",  "loamy"),
+                    "soil_type":  action_data.get("soil_type", "loamy"),
                     "fertilizer": action_data.get("fertilizer", None),
-                    "crop":       action_data.get("crop",        None),
+                    "crop":       action_data.get("crop", None),
                 }
                 try:
                     result = env.step(action)
@@ -289,10 +231,19 @@ async def websocket_endpoint(websocket: WebSocket):
                         },
                     }))
             else:
-                await websocket.send_text(json.dumps({"type": "error", "data": {"message": f"Unknown type: {mtype}"}}))
+                await websocket.send_text(json.dumps({"type": "error", "data": {"message": f"Unknown: {mtype}"}}))
 
     except WebSocketDisconnect:
         pass
 
-if __name__ == "__main__":
+
+# ─────────────────────────────────────────────
+# Required by openenv validate
+# ─────────────────────────────────────────────
+
+def main():
     uvicorn.run(app, host="0.0.0.0", port=7860)
+
+
+if __name__ == "__main__":
+    main()
