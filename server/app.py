@@ -3,10 +3,10 @@ app.py  —  Soil Analysis Environment Server
 Fully OpenEnv-compatible: /health, /schema, /metadata, /state, /reset, /step, /ws
 """
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any, Dict
 import uvicorn
 import json
 
@@ -21,19 +21,25 @@ app = FastAPI(
 _sessions: dict = {}
 
 # ─────────────────────────────────────────────
-# Request models
+# Request models — ALL fields optional with defaults
 # ─────────────────────────────────────────────
 
 class ResetRequest(BaseModel):
-    task: str = "easy"
-    seed: Optional[int] = 42
-    session_id: str = "default"
+    task: Optional[str] = "easy"
+    seed: Optional[int] = None
+    session_id: Optional[str] = "default"
+    episode_id: Optional[str] = None
+    # Allow any extra fields the evaluator might send
+    model_config = {"extra": "allow"}
 
 class StepRequest(BaseModel):
-    session_id: str = "default"
-    soil_type: str
+    session_id: Optional[str] = "default"
+    soil_type: Optional[str] = "loamy"
     fertilizer: Optional[str] = None
     crop: Optional[str] = None
+    # OpenEnv standard step wraps action in "action" key
+    action: Optional[Dict[str, Any]] = None
+    model_config = {"extra": "allow"}
 
 # ─────────────────────────────────────────────
 # Required OpenEnv endpoints
@@ -119,12 +125,6 @@ def root():
   <li><b>GET  /state</b>    — current internal state</li>
   <li><b>WS   /ws</b>       — WebSocket protocol</li>
 </ul>
-<h2>Tasks</h2>
-<ul>
-  <li><b>easy</b>   — identify soil type only (+0.40)</li>
-  <li><b>medium</b> — soil type + fertilizer (+0.70)</li>
-  <li><b>hard</b>   — soil type + fertilizer + crop (+1.00)</li>
-</ul>
 <p><a href="/docs">Open API docs</a></p>
 </body></html>
 """
@@ -145,50 +145,80 @@ def info():
 # ─────────────────────────────────────────────
 
 @app.post("/reset")
-def reset(req: ResetRequest):
-    if req.task not in ("easy", "medium", "hard"):
-        raise HTTPException(status_code=400, detail="task must be 'easy', 'medium', or 'hard'")
-    env = SoilAnalysisEnv(task=req.task, seed=req.seed)
-    obs = env.reset()
-    _sessions[req.session_id] = env
-    return {"session_id": req.session_id, "observation": obs}
+async def reset(request: Request):
+    """
+    Accepts empty body, JSON body, or any OpenEnv reset format.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body is None:
+        body = {}
+
+    task       = body.get("task", "easy") or "easy"
+    seed       = body.get("seed", None)
+    session_id = body.get("session_id", "default") or "default"
+
+    if task not in ("easy", "medium", "hard"):
+        task = "easy"
+
+    env = SoilAnalysisEnv(task=task, seed=seed)
+    obs = env.reset(seed=seed)
+    _sessions[session_id] = env
+
+    return {"session_id": session_id, "observation": obs}
+
 
 @app.post("/step")
-def step(req: StepRequest):
-    env = _sessions.get(req.session_id)
+async def step(request: Request):
+    """
+    Accepts action as flat JSON or nested under "action" key.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body is None:
+        body = {}
+
+    session_id = body.get("session_id", "default") or "default"
+    env = _sessions.get(session_id)
     if env is None:
         raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
 
-    action = {"soil_type": req.soil_type}
-    if req.fertilizer:
-        action["fertilizer"] = req.fertilizer
-    if req.crop:
-        action["crop"] = req.crop
+    # Support both flat and nested action formats
+    # Flat:   {"soil_type": "loamy", "fertilizer": "Compost"}
+    # Nested: {"action": {"soil_type": "loamy"}}
+    if "action" in body and isinstance(body["action"], dict):
+        action_data = body["action"]
+    else:
+        action_data = body
+
+    action = {
+        "soil_type":  action_data.get("soil_type",  "loamy"),
+        "fertilizer": action_data.get("fertilizer", None),
+        "crop":       action_data.get("crop",        None),
+    }
 
     try:
         result = env.step(action)
-        # Support both old tuple return and new dict/object return
         if isinstance(result, tuple):
             obs, reward, done, info = result
-        elif isinstance(result, dict):
-            obs    = result.get("observation", result)
-            reward = result.get("reward", 0.0)
-            done   = result.get("done", True)
-            info   = result.get("info", {})
         else:
-            # Pydantic model
-            d      = result.model_dump() if hasattr(result, "model_dump") else vars(result)
-            reward = d.pop("reward", 0.0)
-            done   = d.pop("done", True)
-            info   = d.pop("metadata", {})
-            obs    = d
+            obs    = result
+            reward = 0.0
+            done   = True
+            info   = {}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"observation": obs, "reward": reward, "done": done, "info": info}
 
 # ─────────────────────────────────────────────
-# WebSocket  (/ws) — primary evaluation path
+# WebSocket /ws — primary evaluation path
 # ─────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -199,13 +229,20 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             raw   = await websocket.receive_text()
-            msg   = json.loads(raw)
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                await websocket.send_text(json.dumps({"type": "error", "data": {"message": "Invalid JSON"}}))
+                continue
+
             mtype = msg.get("type")
+            data  = msg.get("data", {}) or {}
 
             if mtype == "reset":
-                data = msg.get("data", {})
-                env  = SoilAnalysisEnv(task=data.get("task", "easy"), seed=data.get("seed"))
-                obs  = env.reset()
+                task = data.get("task", "easy") or "easy"
+                seed = data.get("seed", None)
+                env  = SoilAnalysisEnv(task=task, seed=seed)
+                obs  = env.reset(seed=seed)
                 await websocket.send_text(json.dumps({
                     "type": "observation",
                     "data": {"observation": obs, "reward": None, "done": False},
@@ -215,25 +252,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 if env is None:
                     await websocket.send_text(json.dumps({"type": "error", "data": {"message": "Call reset first"}}))
                     continue
-                data   = msg.get("data", {})
-                action = {k: data[k] for k in ("soil_type", "fertilizer", "crop") if data.get(k)}
-                if "soil_type" not in action:
-                    action["soil_type"] = "loamy"
+                # Support nested action key
+                if "action" in data and isinstance(data["action"], dict):
+                    action_data = data["action"]
+                else:
+                    action_data = data
+                action = {
+                    "soil_type":  action_data.get("soil_type",  "loamy"),
+                    "fertilizer": action_data.get("fertilizer", None),
+                    "crop":       action_data.get("crop",        None),
+                }
                 try:
                     result = env.step(action)
                     if isinstance(result, tuple):
                         obs, reward, done, info = result
-                    elif isinstance(result, dict):
-                        obs    = result.get("observation", result)
-                        reward = result.get("reward", 0.0)
-                        done   = result.get("done", True)
-                        info   = result.get("info", {})
                     else:
-                        d      = result.model_dump() if hasattr(result, "model_dump") else vars(result)
-                        reward = d.pop("reward", 0.0)
-                        done   = d.pop("done", True)
-                        info   = d.pop("metadata", {})
-                        obs    = d
+                        obs, reward, done, info = result, 0.0, True, {}
                     await websocket.send_text(json.dumps({
                         "type": "observation",
                         "data": {"observation": obs, "reward": reward, "done": done, "info": info},
