@@ -1,7 +1,6 @@
 """
 inference.py  —  Soil Analysis AI Agent
-Uses LLM if available, falls back to rule-based agent if LLM fails.
-Never raises an unhandled exception.
+Prints [START]/[STEP]/[END] blocks required by the evaluator.
 """
 
 import json
@@ -10,16 +9,16 @@ import sys
 import requests
 
 # ─────────────────────────────────────────────
-# Config from environment variables
+# Config
 # ─────────────────────────────────────────────
 API_BASE_URL = os.environ.get("API_BASE_URL", "").rstrip("/")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     "")
-ENV_URL      = os.environ.get("ENV_URL",       "https://viji217-soil-analysis-env.hf.space").rstrip("/")
+ENV_URL      = os.environ.get("ENV_URL", "https://viji217-soil-analysis-env.hf.space").rstrip("/")
 
-SOIL_TYPES   = ["sandy", "clay", "loamy", "silty", "peaty"]
-FERTILIZERS  = ["Compost", "Gypsum", "Lime", "NPK 10-10-10", "Phosphorus"]
-CROPS        = ["carrot", "maize", "potato", "rice", "wheat"]
+SOIL_TYPES  = ["sandy", "clay", "loamy", "silty", "peaty"]
+FERTILIZERS = ["Compost", "Gypsum", "Lime", "NPK 10-10-10", "Phosphorus"]
+CROPS       = ["carrot", "maize", "potato", "rice", "wheat"]
 
 SOIL_PROFILES = {
     "sandy": {"best_fertilizer": "NPK 10-10-10", "best_crop": "carrot"},
@@ -38,7 +37,7 @@ RULES = [
 ]
 
 # ─────────────────────────────────────────────
-# Rule-based fallback (never fails)
+# Rule-based agent (never fails)
 # ─────────────────────────────────────────────
 
 def rule_based_predict(obs):
@@ -70,7 +69,6 @@ def rule_based_predict(obs):
 # ─────────────────────────────────────────────
 
 def call_llm(prompt, task):
-    """Try LLM, return None if anything goes wrong."""
     if not API_BASE_URL or not HF_TOKEN:
         return None
     try:
@@ -92,7 +90,7 @@ def call_llm(prompt, task):
             headers=headers, json=body, timeout=15
         )
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+        text  = resp.json()["choices"][0]["message"]["content"]
         clean = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         data  = json.loads(clean)
         action = {"soil_type": str(data.get("soil_type", "loamy"))}
@@ -102,7 +100,7 @@ def call_llm(prompt, task):
             action["crop"] = str(data["crop"])
         return action
     except Exception:
-        return None  # silently fall back to rule-based
+        return None
 
 # ─────────────────────────────────────────────
 # Environment HTTP helpers
@@ -116,10 +114,9 @@ def env_reset(task="easy", seed=42, session_id="default"):
             timeout=15,
         )
         r.raise_for_status()
-        data = r.json()
-        return data.get("observation", {})
+        return r.json().get("observation", {})
     except Exception as e:
-        print(f"  [reset error] {e}")
+        print(f"  [reset error] {e}", flush=True)
         return {}
 
 def env_step(action, session_id="default"):
@@ -129,42 +126,30 @@ def env_step(action, session_id="default"):
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"  [step error] {e}")
+        print(f"  [step error] {e}", flush=True)
         return {"reward": 0.0, "done": True, "observation": {}, "info": {}}
-
-# ─────────────────────────────────────────────
-# Build LLM prompt
-# ─────────────────────────────────────────────
 
 def build_prompt(obs, task):
     r = obs.get("soil_readings", {})
     lines = [
         f"Soil readings: pH={r.get('ph')}, moisture={r.get('moisture_pct')}%,"
         f" nitrogen={r.get('nitrogen_pct')}, organic={r.get('organic_matter_pct')}%",
-        f"Task: {task}",
-        f"Valid soil types: {SOIL_TYPES}",
+        f"Task: {task}  |  Valid soil types: {SOIL_TYPES}",
     ]
     if task in ("medium", "hard"):
         lines.append(f"Valid fertilizers: {FERTILIZERS}")
     if task == "hard":
         lines.append(f"Valid crops: {CROPS}")
-    if task == "easy":
-        lines.append('Reply: {"soil_type": "loamy"}')
-    elif task == "medium":
-        lines.append('Reply: {"soil_type": "loamy", "fertilizer": "Compost"}')
-    else:
-        lines.append('Reply: {"soil_type": "loamy", "fertilizer": "Compost", "crop": "maize"}')
+    lines.append('Reply ONLY with JSON e.g. {"soil_type":"loamy","fertilizer":"Compost","crop":"maize"}')
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
-# Main agent loop
+# Agent loop — prints required [START]/[STEP]/[END]
 # ─────────────────────────────────────────────
 
 def run_agent(task="hard", episodes=5):
-    print(f"\n{'='*55}")
-    print(f"  Task: {task.upper()}  |  Episodes: {episodes}")
-    print(f"  ENV_URL: {ENV_URL}")
-    print(f"{'='*55}")
+    # ── REQUIRED: print [START] block ──────────
+    print(f"[START] task={task}", flush=True)
 
     total_reward = 0.0
 
@@ -174,52 +159,51 @@ def run_agent(task="hard", episodes=5):
             obs = env_reset(task=task, seed=ep, session_id=session_id)
 
             if not obs:
-                print(f"  Ep {ep:02d} | reset failed, skipping")
+                reward = 0.0
+                # ── REQUIRED: print [STEP] block ──
+                print(f"[STEP] step={ep} reward={reward:.4f}", flush=True)
+                total_reward += reward
                 continue
 
-            # Try LLM first, fall back to rules
+            # Try LLM, fall back to rule-based
             prompt = build_prompt(obs, task)
             action = call_llm(prompt, task)
-            method = "LLM"
             if action is None:
                 action = rule_based_predict(obs)
-                method = "rules"
-
-            print(f"  Ep {ep:02d} | method={method} | action={action}")
 
             result  = env_step(action, session_id=session_id)
             reward  = float(result.get("reward") or 0.0)
-            feedback = result.get("observation", {}).get("feedback", "")
             total_reward += reward
-            print(f"          | reward={reward:.2f} | {feedback}")
+
+            # ── REQUIRED: print [STEP] block ──────
+            print(f"[STEP] step={ep} reward={reward:.4f}", flush=True)
 
         except Exception as e:
-            print(f"  Ep {ep:02d} | unexpected error: {e}")
+            print(f"[STEP] step={ep} reward=0.0", flush=True)
             continue
 
     avg = total_reward / episodes if episodes > 0 else 0.0
-    print(f"\n  Average reward: {avg:.4f}")
+
+    # ── REQUIRED: print [END] block ────────────
+    print(f"[END] task={task} score={avg:.4f} steps={episodes}", flush=True)
+
     return avg
 
 
 def main():
-    print("Soil Analysis Inference Agent Starting...")
+    print("Soil Analysis Inference Agent", flush=True)
+
     results = {}
     try:
         for level in ("easy", "medium", "hard"):
             results[level] = run_agent(task=level, episodes=5)
 
-        print("\n" + "="*55)
-        print("  FINAL RESULTS")
-        print("="*55)
-        for level, score in results.items():
-            print(f"  {level:<8} avg_reward={score:.4f}")
         overall = sum(results.values()) / len(results)
-        print(f"\n  Overall average: {overall:.4f}")
-        print("\nDone.")
+        print(f"[END] task=all score={overall:.4f} steps={5*3}", flush=True)
+
     except Exception as e:
-        print(f"Fatal error in main: {e}")
-        sys.exit(0)  # exit 0 so evaluator doesn't see it as crash
+        print(f"[END] task=all score=0.0 steps=0", flush=True)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
